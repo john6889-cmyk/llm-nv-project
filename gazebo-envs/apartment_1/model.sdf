@@ -11,7 +11,7 @@
             <size>1.53796 0.15 2.5</size>
           </box>
         </geometry>
-        <material>
+        <material> 
           <script>
             <uri>file://media/materials/scripts/gazebo.material</uri>
             <name>Gazebo/Bricks</name>
