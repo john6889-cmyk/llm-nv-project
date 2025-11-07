@@ -2,7 +2,7 @@ from PIL import Image
 import os
 
 # Open the PGM file
-pgm_path = "/home/atharvahude/maps/apartment.pgm"  # Replace with your actual file name
+pgm_path = "./maps/savedmap.pgm"  # Replace with your actual file name
 pgm_image = Image.open(pgm_path)
 
 # Change extension to .png while keeping the same name

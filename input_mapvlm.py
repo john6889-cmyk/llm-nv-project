@@ -2,7 +2,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 # Load the provided SLAM-generated map
-image_path = "/mnt/data/apartment.png"
+image_path = "./maps/savedmap.png"
 img = Image.open(image_path)
 
 # Display the image to analyze the structure
