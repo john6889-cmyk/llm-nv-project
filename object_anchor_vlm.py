@@ -4,6 +4,7 @@
 import time
 import json
 import base64
+import math
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -12,22 +13,15 @@ import requests
 import rclpy
 from rclpy.node import Node
 
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2
-from geometry_msgs.msg import PointStamped
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped, PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 
 import tf2_ros
 from rclpy.time import Time
-from rclpy.duration import Duration
 import tf2_geometry_msgs  # noqa: F401  (required to register transform for PointStamped)
-
-# Optional organized cloud helper
-try:
-    from sensor_msgs_py import point_cloud2 as pc2
-except Exception:
-    pc2 = None
 
 
 # --------------------- Canonical labels for the TB4 warehouse world ---------------------
@@ -198,8 +192,8 @@ class ObjectAnchorVLM(Node):
         self.declare_parameter("camera_rgb", "/oakd/rgb/preview/image_raw")
         self.declare_parameter("camera_info", "/oakd/rgb/preview/camera_info")
         self.declare_parameter("camera_depth", "/oakd/rgb/preview/depth")
-        self.declare_parameter("pointcloud", "/oakd/rgb/preview/depth/points")
         self.declare_parameter("camera_frame", "oakd_rgb_camera_optical_frame")
+        self.declare_parameter("robot_pose_topic", "/map/pose")
 
         # Depth units (OAK-D depth is typically 16UC1 in millimeters)
         self.declare_parameter("depth_scale", 0.001)  # mm -> meters
@@ -213,7 +207,6 @@ class ObjectAnchorVLM(Node):
         self.declare_parameter("send_depth_to_vlm", True)  # include depth colormap as second image
         self.declare_parameter("display_rgb", False)
         self.declare_parameter("display_depth", False)
-        self.declare_parameter("display_pointcloud", False)
         self.declare_parameter("log_raw_vlm", False)
 
         # --- Tracking / promotion ---
@@ -230,8 +223,8 @@ class ObjectAnchorVLM(Node):
         self.rgb_topic = gp("camera_rgb").value
         self.info_topic = gp("camera_info").value
         self.depth_topic = gp("camera_depth").value
-        self.pc_topic = gp("pointcloud").value
         self.cam_frame = gp("camera_frame").value
+        self.robot_pose_topic = gp("robot_pose_topic").value
         self.depth_scale = float(gp("depth_scale").value)
 
         self.detect_dt = 1.0 / float(gp("detect_rate_hz").value)
@@ -239,14 +232,13 @@ class ObjectAnchorVLM(Node):
         self.send_depth = bool(gp("send_depth_to_vlm").value)
         self.display_rgb = bool(gp("display_rgb").value)
         self.display_depth = bool(gp("display_depth").value)
-        self.display_pointcloud = bool(gp("display_pointcloud").value)
         self.vlm_api_style = str(gp("vlm_api_style").value)
         self.log_raw_vlm = bool(gp("log_raw_vlm").value)
 
         self.detector = VLMDetector(
             url=str(gp("vlm_url").value),
             model=str(gp("vlm_model").value),
-            timeout=20.0,
+            timeout=60.0,
             api_style=self.vlm_api_style,
             log_raw=self.log_raw_vlm,
         )
@@ -262,7 +254,7 @@ class ObjectAnchorVLM(Node):
         self.sub_info = self.create_subscription(CameraInfo, self.info_topic, self.cb_info, 10)
         self.sub_depth = self.create_subscription(Image, self.depth_topic, self.cb_depth, 10)
         self.sub_rgb = self.create_subscription(Image, self.rgb_topic, self.cb_rgb, 10)
-        self.sub_pc = self.create_subscription(PointCloud2, self.pc_topic, self.cb_pc, 10)
+        self.sub_pose = self.create_subscription(PoseStamped, self.robot_pose_topic, self.cb_robot_pose, 10)
 
         self.pub_mark = self.create_publisher(MarkerArray, "/objects/markers", 10)
         self.srv_list = self.create_service(Trigger, "list_anchors", self.handle_list)
@@ -275,13 +267,14 @@ class ObjectAnchorVLM(Node):
         self.K: np.ndarray = None         # camera intrinsics (3x3)
         self.fx = self.fy = self.px = self.py = None
         self.depth: np.ndarray = None     # meters
-        self.pc_msg: PointCloud2 = None   # organized cloud (optional)
         self._last_t = 0.0                # detector throttle
         self.store: Dict[str, List[dict]] = {}  # label -> tracks
+        self.robot_pose: PoseStamped = None
         self._canvas_window = "object_anchor_vlm/Composite"
-        self._display_error_logged = {"rgb": False, "depth": False, "pc": False}
+        self._display_enabled = False
+        self._display_error_logged = False
         self._latest_depth_vis = None
-        self._latest_pc_vis = None
+        self._latest_rgb = None
         self._init_display_windows()
 
     # ---------------- Callbacks ----------------
@@ -298,11 +291,10 @@ class ObjectAnchorVLM(Node):
             self.depth = img.astype(np.float32)
         if self.display_depth and self.depth is not None:
             self._latest_depth_vis = make_depth_colormap(self.depth)
+            self._render_display_canvas()
 
-    def cb_pc(self, msg: PointCloud2):
-        self.pc_msg = msg
-        if self.display_pointcloud and pc2 is not None:
-            self._latest_pc_vis = self._build_pc_topdown(msg)
+    def cb_robot_pose(self, msg: PoseStamped):
+        self.robot_pose = msg
 
     def cb_rgb(self, msg: Image):
         bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -365,6 +357,12 @@ class ObjectAnchorVLM(Node):
         anch = sum(1 for L in self.store.values() for t in L if t["anchored"])
         pend = sum(1 for L in self.store.values() for t in L if not t["anchored"])
         self.get_logger().info(f"Anchors: {anch}  |  Pending tracks: {pend}  |  Labels: {list(self.store.keys())[:6]}")
+        pose_tuple = self._current_robot_pose()
+        if pose_tuple:
+            rx, ry, rz, yaw = pose_tuple
+            self.get_logger().info(
+                f"Robot pose (map frame): x={rx:.2f} m, y={ry:.2f} m, z={rz:.2f} m, yaw={math.degrees(yaw):.1f} deg"
+            )
         for label, xyz, score in detections_to_report:
             dist = float(np.linalg.norm(xyz))
             self.get_logger().info(
@@ -401,90 +399,42 @@ class ObjectAnchorVLM(Node):
             })
 
     def _init_display_windows(self):
-        for key, enabled, window in [
-            ("canvas", self.display_rgb or self.display_depth or self.display_pointcloud, self._canvas_window),
-        ]:
-            if not enabled:
-                continue
-            try:
-                cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            except cv2.error as e:
-                self.get_logger().warn(f"Failed to create {key} display window: {e}")
-                if key == "rgb":
-                    self.display_rgb = False
-                elif key == "depth":
-                    self.display_depth = False
-                elif key == "pc":
-                    self.display_pointcloud = False
-                elif key == "canvas":
-                    self.display_rgb = self.display_depth = self.display_pointcloud = False
-        if self.display_pointcloud and pc2 is None:
-            self.get_logger().warn("display_pointcloud requested but sensor_msgs_py.point_cloud2 is unavailable.")
-            self.display_pointcloud = False
-
-    def _display_image(self, key: str, window: str, image: np.ndarray):
-        enabled = key == "canvas" and (self.display_rgb or self.display_depth or self.display_pointcloud)
-        if not enabled or image is None:
+        self._display_enabled = self.display_rgb or self.display_depth
+        if not self._display_enabled:
             return
         try:
-            cv2.imshow(window, image)
+            cv2.namedWindow(self._canvas_window, cv2.WINDOW_NORMAL)
+        except cv2.error as e:
+            self.get_logger().warn(f"Failed to create display window: {e}")
+            self.display_rgb = False
+            self.display_depth = False
+            self._display_enabled = False
+
+    def _display_image(self, image: np.ndarray):
+        if not self._display_enabled or image is None:
+            return
+        try:
+            cv2.imshow(self._canvas_window, image)
             cv2.waitKey(1)
         except cv2.error as e:
-            if not self._display_error_logged.get(key, False):
-                self.get_logger().warn(f"{key.upper()} display failed: {e}")
-                self._display_error_logged[key] = True
-            if key == "rgb":
-                self.display_rgb = False
-            elif key == "depth":
-                self.display_depth = False
-            elif key == "pc":
-                self.display_pointcloud = False
-            elif key == "canvas":
-                self.display_rgb = self.display_depth = self.display_pointcloud = False
-
-    def _build_pc_topdown(self, msg: PointCloud2, max_pts: int = 5000, res: int = 480):
-        if msg.width == 0 or msg.height == 0:
-            return None
-        pts = []
-        try:
-            for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-                if not np.isfinite(p[2]):
-                    continue
-                pts.append((p[0], p[1]))
-                if len(pts) >= max_pts:
-                    break
-        except Exception:
-            return None
-        if not pts:
-            return None
-        arr = np.array(pts, dtype=np.float32)
-        min_xy = arr.min(axis=0)
-        max_xy = arr.max(axis=0)
-        span = np.maximum(max_xy - min_xy, 1e-3)
-        norm = (arr - min_xy) / span
-        norm = np.clip(norm, 0.0, 0.999)
-        canvas = np.zeros((res, res, 3), dtype=np.uint8)
-        xs = (norm[:, 0] * (res - 1)).astype(np.int32)
-        ys = (norm[:, 1] * (res - 1)).astype(np.int32)
-        canvas[res - 1 - ys, xs] = (0, 200, 255)
-        cv2.putText(canvas, "Top-down X/Y (relative)", (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        return canvas
+            if not self._display_error_logged:
+                self.get_logger().warn(f"Display failed: {e}")
+                self._display_error_logged = True
+            self._display_enabled = False
+            self.display_rgb = False
+            self.display_depth = False
 
     def _render_display_canvas(self):
-        if not (self.display_rgb or self.display_depth or self.display_pointcloud):
+        if not self._display_enabled:
             return
         tiles = []
         labels = []
-        if self.display_rgb and getattr(self, "_latest_rgb", None) is not None:
+        if self.display_rgb and self._latest_rgb is not None:
             tiles.append(self._latest_rgb)
             labels.append("RGB")
         if self.display_depth and self._latest_depth_vis is not None:
             tiles.append(self._latest_depth_vis)
             labels.append("Depth")
-        if self.display_pointcloud and self._latest_pc_vis is not None:
-            tiles.append(self._latest_pc_vis)
-            labels.append("Point Cloud")
 
         if not tiles:
             return
@@ -493,25 +443,21 @@ class ObjectAnchorVLM(Node):
         canvas = []
         for img, label in zip(tiles, labels):
             h, w = img.shape[:2]
-            scale = max_h / h if h > 0 else 1.0
-            new_w = int(w * scale)
+            if h == 0:
+                continue
+            scale = max_h / h
+            new_w = max(1, int(w * scale))
             resized = cv2.resize(img, (new_w, max_h))
             cv2.putText(resized, label, (10, max_h - 10), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 255), 1, cv2.LINE_AA)
             canvas.append(resized)
+        if not canvas:
+            return
         composite = np.hstack(canvas)
-        self._display_image("canvas", self._canvas_window, composite)
+        self._display_image(composite)
 
     def estimate_camera_xyz(self, umin: int, umax: int, vmin: int, vmax: int) -> np.ndarray:
-        depth_pts = self._depth_patch_points(umin, umax, vmin, vmax)
-        cloud_pts = self._cloud_patch_points(umin, umax, vmin, vmax)
-
-        pts = None
-        if depth_pts is not None and cloud_pts is not None:
-            pts = np.vstack([depth_pts, cloud_pts])
-        else:
-            pts = depth_pts if depth_pts is not None else cloud_pts
-
+        pts = self._depth_patch_points(umin, umax, vmin, vmax)
         if pts is None or pts.shape[0] < 5:
             return None
 
@@ -537,28 +483,16 @@ class ObjectAnchorVLM(Node):
             pts = pts[idx]
         return pts.astype(np.float32)
 
-    def _cloud_patch_points(self, umin: int, umax: int, vmin: int, vmax: int):
-        if pc2 is None or not isinstance(self.pc_msg, PointCloud2):
+    def _current_robot_pose(self):
+        if self.robot_pose is None:
             return None
-        if self.pc_msg.width == 0 or self.pc_msg.height == 0:
-            return None
-        step_u = max(1, (umax - umin) // 8)
-        step_v = max(1, (vmax - vmin) // 8)
-        pts = []
-        try:
-            for vv in range(vmin, vmax, step_v):
-                for uu in range(umin, umax, step_u):
-                    for p in pc2.read_points(
-                        self.pc_msg, field_names=("x", "y", "z"),
-                        skip_nans=True, uvs=[(uu, vv)]
-                    ):
-                        if np.isfinite(p[2]) and p[2] > 0.1:
-                            pts.append([p[0], p[1], p[2]])
-            if not pts:
-                return None
-            return np.array(pts, dtype=np.float32)
-        except Exception:
-            return None
+        p = self.robot_pose.pose.position
+        q = self.robot_pose.pose.orientation
+        # yaw from quaternion
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        return (float(p.x), float(p.y), float(p.z), yaw)
 
     # ---------------- Outputs ----------------
     def publish_markers(self):
@@ -614,16 +548,28 @@ class ObjectAnchorVLM(Node):
 
     def write_json(self):
         out = []
+        pose_snapshot = None
+        if self.robot_pose is not None:
+            p = self.robot_pose.pose.position
+            q = self.robot_pose.pose.orientation
+            pose_snapshot = {
+                "frame": self.robot_pose.header.frame_id or "map",
+                "position": [float(p.x), float(p.y), float(p.z)],
+                "orientation": [float(q.x), float(q.y), float(q.z), float(q.w)],
+            }
         for label, tracks in self.store.items():
             for t in tracks:
                 if not t["anchored"]:
                     continue
-                out.append({
+                entry = {
                     "label": label,
                     "xyz": [float(v) for v in t["mean"]],
                     "n": int(t["n"]),
                     "last_seen": float(t["last"]),
-                })
+                }
+                if pose_snapshot:
+                    entry["robot_pose"] = pose_snapshot
+                out.append(entry)
         with open(self.json_path, "w") as f:
             json.dump(out, f, indent=2)
 
