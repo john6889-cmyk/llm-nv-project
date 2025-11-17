@@ -10,8 +10,8 @@ class Detection:
     bbox: Tuple[int,int,int,int]  # (u1,v1,u2,v2)
 
 class VLMDetector:
-    def __init__(self, url="http://saltyfish.eecs.umich.edu:8000/v1/chat/completions",
-                 model="Qwen/Qwen3-VL-30B-A3B-Instruct", timeout=20):
+    def __init__(self, url="http://ronaldo.eecs.umich.edu:11400/api/generate",
+                 model="llava", timeout=20):
         self.url = url
         self.model = model
         self.timeout = timeout
@@ -39,23 +39,20 @@ class VLMDetector:
         H, W = bgr_rgb.shape[:2]
         prompt = self._build_prompt(W, H, categories)
 
-        content = [{"type": "text", "text": prompt},
-                   {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self._b64_from_bgr(bgr_rgb)}"}}]
-
+        images = [self._b64_from_bgr(bgr_rgb)]
         if extra_images_bgr:
-            for img in extra_images_bgr:
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{self._b64_from_bgr(img)}"}})
+            images.extend(self._b64_from_bgr(img) for img in extra_images_bgr)
 
         data = {
             "model": self.model,
-            "messages": [{"role":"user","content": content}],
-            "temperature": temperature,
-            "top_p": top_p
+            "prompt": prompt,
+            "images": images,
+            "stream": False,
+            "options": {"temperature": temperature, "top_p": top_p}
         }
-        r = requests.post(self.url, json=data, timeout=self.timeout)
+        r = requests.post(self.url, headers={"Content-Type": "application/json"}, json=data, timeout=self.timeout)
         r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"].strip()
+        reply = str(r.json().get("response", "")).strip()
 
         if reply.startswith("```"):
             lines = reply.splitlines()

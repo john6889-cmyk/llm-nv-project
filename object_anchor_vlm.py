@@ -74,18 +74,25 @@ class Detection:
 
 class VLMDetector:
     """
-    Simple client for your Qwen3-VL server that returns strict JSON with pixel bboxes.
+    Client that can talk to either the Ollama-style `/api/generate` endpoint or
+    the OpenAI/Qwen chat-completions endpoint.
     """
 
     def __init__(
         self,
-        url: str = "http://saltyfish.eecs.umich.edu:8000/v1/chat/completions",
-        model: str = "Qwen/Qwen3-VL-30B-A3B-Instruct",
-        timeout: float = 20.0,
+        url: str = "http://ronaldo.eecs.umich.edu:11400/api/generate",
+        model: str = "llava",
+        timeout: float = 30.0,
+        api_style: str = "ollama",
+        log_raw: bool = False,
     ):
         self.url = url
         self.model = model
         self.timeout = timeout
+        self.api_style = api_style.lower()
+        if self.api_style not in ("ollama", "chat"):
+            raise ValueError(f"Unsupported VLM API style '{api_style}'. Expected 'ollama' or 'chat'.")
+        self.log_raw = log_raw
 
     @staticmethod
     def _b64_from_bgr(bgr: np.ndarray, jpeg_quality: int = 85) -> str:
@@ -116,27 +123,51 @@ class VLMDetector:
         top_p: float = 1.0,
     ) -> List[Detection]:
         H, W = bgr_rgb.shape[:2]
-        content = [
-            {"type": "text", "text": self._build_prompt(W, H, categories)},
-            {"type": "image_url",
-             "image_url": {"url": f"data:image/jpeg;base64,{self._b64_from_bgr(bgr_rgb)}"}},
-        ]
-        if extra_images_bgr:
-            for img in extra_images_bgr:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{self._b64_from_bgr(img)}"}
-                })
+        prompt = self._build_prompt(W, H, categories)
 
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": temperature,
-            "top_p": top_p,
-        }
-        r = requests.post(self.url, json=payload, timeout=self.timeout)
+        if self.api_style == "ollama":
+            images = [self._b64_from_bgr(bgr_rgb)]
+            if extra_images_bgr:
+                images.extend(self._b64_from_bgr(img) for img in extra_images_bgr)
+
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "images": images,
+                "stream": False,
+                "options": {"temperature": temperature, "top_p": top_p},
+            }
+        else:
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{self._b64_from_bgr(bgr_rgb)}"}},
+            ]
+            if extra_images_bgr:
+                for img in extra_images_bgr:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{self._b64_from_bgr(img)}"}
+                    })
+
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": content}],
+                "temperature": temperature,
+                "top_p": top_p,
+            }
+        r = requests.post(self.url, headers={"Content-Type": "application/json"}, json=payload, timeout=self.timeout)
         r.raise_for_status()
-        reply = r.json()["response"][0]["message"]["content"].strip()
+        resp_obj = r.json()
+        if self.api_style == "ollama":
+            reply = str(resp_obj.get("response", "")).strip()
+        else:
+            choices = resp_obj.get("choices", [])
+            if not choices:
+                raise RuntimeError(f"Unexpected chat response: {resp_obj}")
+            reply = str(choices[0]["message"]["content"]).strip()
+        if self.log_raw:
+            print("[VLM raw response]", resp_obj)
 
         # Strip code fences if present
         if reply.startswith("```"):
@@ -179,9 +210,14 @@ class ObjectAnchorVLM(Node):
         # --- VLM detection ---
         self.declare_parameter("detect_rate_hz", 1.0)
         self.declare_parameter("categories", list(CANON.keys()))
-        self.declare_parameter("vlm_url", "http://saltyfish.eecs.umich.edu:8000/v1/chat/completions")
-        self.declare_parameter("vlm_model", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+        self.declare_parameter("vlm_url", "http://ronaldo.eecs.umich.edu:11400/api/generate")
+        self.declare_parameter("vlm_model", "llava")
+        self.declare_parameter("vlm_api_style", "ollama")  # 'ollama' or 'chat'
         self.declare_parameter("send_depth_to_vlm", True)  # include depth colormap as second image
+        self.declare_parameter("display_rgb", False)
+        self.declare_parameter("display_depth", False)
+        self.declare_parameter("display_pointcloud", False)
+        self.declare_parameter("log_raw_vlm", False)
 
         # --- Tracking / promotion ---
         self.declare_parameter("gate_radius", 0.7)       # m, assoc gate
@@ -204,9 +240,18 @@ class ObjectAnchorVLM(Node):
         self.detect_dt = 1.0 / float(gp("detect_rate_hz").value)
         self.categories = list(gp("categories").value)
         self.send_depth = bool(gp("send_depth_to_vlm").value)
+        self.display_rgb = bool(gp("display_rgb").value)
+        self.display_depth = bool(gp("display_depth").value)
+        self.display_pointcloud = bool(gp("display_pointcloud").value)
+        self.vlm_api_style = str(gp("vlm_api_style").value)
+        self.log_raw_vlm = bool(gp("log_raw_vlm").value)
 
         self.detector = VLMDetector(
-            url=str(gp("vlm_url").value), model=str(gp("vlm_model").value), timeout=20.0
+            url=str(gp("vlm_url").value),
+            model=str(gp("vlm_model").value),
+            timeout=20.0,
+            api_style=self.vlm_api_style,
+            log_raw=self.log_raw_vlm,
         )
 
         self.gate_r = float(gp("gate_radius").value)
@@ -231,14 +276,22 @@ class ObjectAnchorVLM(Node):
 
         # State
         self.K: np.ndarray = None         # camera intrinsics (3x3)
+        self.fx = self.fy = self.px = self.py = None
         self.depth: np.ndarray = None     # meters
         self.pc_msg: PointCloud2 = None   # organized cloud (optional)
         self._last_t = 0.0                # detector throttle
         self.store: Dict[str, List[dict]] = {}  # label -> tracks
+        self._canvas_window = "object_anchor_vlm/Composite"
+        self._display_error_logged = {"rgb": False, "depth": False, "pc": False}
+        self._latest_depth_vis = None
+        self._latest_pc_vis = None
+        self._init_display_windows()
 
     # ---------------- Callbacks ----------------
     def cb_info(self, msg: CameraInfo):
         self.K = np.array(msg.k, dtype=np.float32).reshape(3, 3)
+        self.fx, self.fy = self.K[0, 0], self.K[1, 1]
+        self.px, self.py = self.K[0, 2], self.K[1, 2]
 
     def cb_depth(self, msg: Image):
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
@@ -246,11 +299,19 @@ class ObjectAnchorVLM(Node):
             self.depth = img.astype(np.float32) * self.depth_scale
         else:
             self.depth = img.astype(np.float32)
+        if self.display_depth and self.depth is not None:
+            self._latest_depth_vis = make_depth_colormap(self.depth)
 
     def cb_pc(self, msg: PointCloud2):
         self.pc_msg = msg
+        if self.display_pointcloud and pc2 is not None:
+            self._latest_pc_vis = self._build_pc_topdown(msg)
 
     def cb_rgb(self, msg: Image):
+        bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        self._latest_rgb = bgr
+        self._render_display_canvas()
+
         now = time.time()
         if now - self._last_t < self.detect_dt:
             return
@@ -258,8 +319,6 @@ class ObjectAnchorVLM(Node):
 
         if self.K is None or self.depth is None:
             return
-
-        bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         extra_imgs = [make_depth_colormap(self.depth)] if self.send_depth and self.depth is not None else None
 
         # Ask VLM
@@ -270,6 +329,7 @@ class ObjectAnchorVLM(Node):
             return
 
         H, W = bgr.shape[:2]
+        detections_to_report = []
         for d in dets:
             u1, v1, u2, v2 = d.bbox
             # robust center patch
@@ -280,43 +340,14 @@ class ObjectAnchorVLM(Node):
             umin, umax = max(0, u - du), min(W, u + du)
             vmin, vmax = max(0, v - dv), min(H, v + dv)
 
-            # 1) aligned depth median
-            patch = self.depth[vmin:vmax, umin:umax]
-            valid = patch[np.isfinite(patch) & (patch > 0.1)]
-            Zs = valid.flatten()
-
-            # 2) optional organized cloud sampling for extra robustness
-            if pc2 is not None and isinstance(self.pc_msg, PointCloud2):
-                try:
-                    if self.pc_msg.width > 0 and self.pc_msg.height > 0:
-                        step_u = max(1, (umax - umin) // 8)
-                        step_v = max(1, (vmax - vmin) // 8)
-                        cloud_Zs = []
-                        for vv in range(vmin, vmax, step_v):
-                            for uu in range(umin, umax, step_u):
-                                for p in pc2.read_points(
-                                    self.pc_msg, field_names=("x", "y", "z"),
-                                    skip_nans=True, uvs=[(uu, vv)]
-                                ):
-                                    if np.isfinite(p[2]) and p[2] > 0.1:
-                                        cloud_Zs.append(p[2])
-                        if len(cloud_Zs) >= 5:
-                            Zs = np.concatenate([Zs, np.array(cloud_Zs, dtype=np.float32)])
-                except Exception:
-                    pass
-
-            if Zs.size < 5:
+            cam_xyz = self.estimate_camera_xyz(umin, umax, vmin, vmax)
+            if cam_xyz is None:
                 continue
-
-            Z = float(np.median(Zs))
-            fx, fy, px, py = self.K[0, 0], self.K[1, 1], self.K[0, 2], self.K[1, 2]
-            Xc = (u - px) * Z / fx
-            Yc = (v - py) * Z / fy
 
             pt = PointStamped()
             pt.header.stamp = msg.header.stamp
             pt.header.frame_id = self.cam_frame
-            pt.point.x, pt.point.y, pt.point.z = float(Xc), float(Yc), float(Z)
+            pt.point.x, pt.point.y, pt.point.z = [float(v) for v in cam_xyz]
 
             try:
                 # tf2: transform to map frame
@@ -327,7 +358,9 @@ class ObjectAnchorVLM(Node):
                 self.get_logger().warn(f"TF failed: {e}")
                 continue
 
-            self.update_tracks(canonize(d.label), xyz)
+            label = canonize(d.label)
+            self.update_tracks(label, xyz)
+            detections_to_report.append((label, xyz, d.score))
 
         self.publish_markers()
         if self.save_json:
@@ -335,6 +368,11 @@ class ObjectAnchorVLM(Node):
         anch = sum(1 for L in self.store.values() for t in L if t["anchored"])
         pend = sum(1 for L in self.store.values() for t in L if not t["anchored"])
         self.get_logger().info(f"Anchors: {anch}  |  Pending tracks: {pend}  |  Labels: {list(self.store.keys())[:6]}")
+        for label, xyz, score in detections_to_report:
+            dist = float(np.linalg.norm(xyz))
+            self.get_logger().info(
+                f"[{label}] map coords x={xyz[0]:.2f} m, y={xyz[1]:.2f} m, z={xyz[2]:.2f} m (range {dist:.2f} m, score {score:.2f})"
+            )
 
 
     # ---------------- Tracking / Promotion ----------------
@@ -364,6 +402,166 @@ class ObjectAnchorVLM(Node):
                 "anchored": False,
                 "last": time.time(),
             })
+
+    def _init_display_windows(self):
+        for key, enabled, window in [
+            ("canvas", self.display_rgb or self.display_depth or self.display_pointcloud, self._canvas_window),
+        ]:
+            if not enabled:
+                continue
+            try:
+                cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            except cv2.error as e:
+                self.get_logger().warn(f"Failed to create {key} display window: {e}")
+                if key == "rgb":
+                    self.display_rgb = False
+                elif key == "depth":
+                    self.display_depth = False
+                elif key == "pc":
+                    self.display_pointcloud = False
+                elif key == "canvas":
+                    self.display_rgb = self.display_depth = self.display_pointcloud = False
+        if self.display_pointcloud and pc2 is None:
+            self.get_logger().warn("display_pointcloud requested but sensor_msgs_py.point_cloud2 is unavailable.")
+            self.display_pointcloud = False
+
+    def _display_image(self, key: str, window: str, image: np.ndarray):
+        enabled = key == "canvas" and (self.display_rgb or self.display_depth or self.display_pointcloud)
+        if not enabled or image is None:
+            return
+        try:
+            cv2.imshow(window, image)
+            cv2.waitKey(1)
+        except cv2.error as e:
+            if not self._display_error_logged.get(key, False):
+                self.get_logger().warn(f"{key.upper()} display failed: {e}")
+                self._display_error_logged[key] = True
+            if key == "rgb":
+                self.display_rgb = False
+            elif key == "depth":
+                self.display_depth = False
+            elif key == "pc":
+                self.display_pointcloud = False
+            elif key == "canvas":
+                self.display_rgb = self.display_depth = self.display_pointcloud = False
+
+    def _build_pc_topdown(self, msg: PointCloud2, max_pts: int = 5000, res: int = 480):
+        if msg.width == 0 or msg.height == 0:
+            return None
+        pts = []
+        try:
+            for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+                if not np.isfinite(p[2]):
+                    continue
+                pts.append((p[0], p[1]))
+                if len(pts) >= max_pts:
+                    break
+        except Exception:
+            return None
+        if not pts:
+            return None
+        arr = np.array(pts, dtype=np.float32)
+        min_xy = arr.min(axis=0)
+        max_xy = arr.max(axis=0)
+        span = np.maximum(max_xy - min_xy, 1e-3)
+        norm = (arr - min_xy) / span
+        norm = np.clip(norm, 0.0, 0.999)
+        canvas = np.zeros((res, res, 3), dtype=np.uint8)
+        xs = (norm[:, 0] * (res - 1)).astype(np.int32)
+        ys = (norm[:, 1] * (res - 1)).astype(np.int32)
+        canvas[res - 1 - ys, xs] = (0, 200, 255)
+        cv2.putText(canvas, "Top-down X/Y (relative)", (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        return canvas
+
+    def _render_display_canvas(self):
+        if not (self.display_rgb or self.display_depth or self.display_pointcloud):
+            return
+        tiles = []
+        labels = []
+        if self.display_rgb and getattr(self, "_latest_rgb", None) is not None:
+            tiles.append(self._latest_rgb)
+            labels.append("RGB")
+        if self.display_depth and self._latest_depth_vis is not None:
+            tiles.append(self._latest_depth_vis)
+            labels.append("Depth")
+        if self.display_pointcloud and self._latest_pc_vis is not None:
+            tiles.append(self._latest_pc_vis)
+            labels.append("Point Cloud")
+
+        if not tiles:
+            return
+
+        max_h = max(img.shape[0] for img in tiles)
+        canvas = []
+        for img, label in zip(tiles, labels):
+            h, w = img.shape[:2]
+            scale = max_h / h if h > 0 else 1.0
+            new_w = int(w * scale)
+            resized = cv2.resize(img, (new_w, max_h))
+            cv2.putText(resized, label, (10, max_h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            canvas.append(resized)
+        composite = np.hstack(canvas)
+        self._display_image("canvas", self._canvas_window, composite)
+
+    def estimate_camera_xyz(self, umin: int, umax: int, vmin: int, vmax: int) -> np.ndarray:
+        depth_pts = self._depth_patch_points(umin, umax, vmin, vmax)
+        cloud_pts = self._cloud_patch_points(umin, umax, vmin, vmax)
+
+        pts = None
+        if depth_pts is not None and cloud_pts is not None:
+            pts = np.vstack([depth_pts, cloud_pts])
+        else:
+            pts = depth_pts if depth_pts is not None else cloud_pts
+
+        if pts is None or pts.shape[0] < 5:
+            return None
+
+        # Median is robust against outliers
+        return np.median(pts, axis=0)
+
+    def _depth_patch_points(self, umin: int, umax: int, vmin: int, vmax: int):
+        if self.depth is None or self.fx is None:
+            return None
+        patch = self.depth[vmin:vmax, umin:umax]
+        mask = np.isfinite(patch) & (patch > 0.1)
+        if not np.any(mask):
+            return None
+        rows, cols = np.where(mask)
+        zs = patch[mask]
+        us = umin + cols
+        vs = vmin + rows
+        xs = (us - self.px) * zs / self.fx
+        ys = (vs - self.py) * zs / self.fy
+        pts = np.stack([xs, ys, zs], axis=1)
+        if pts.shape[0] > 600:
+            idx = np.linspace(0, pts.shape[0] - 1, 600).astype(np.int32)
+            pts = pts[idx]
+        return pts.astype(np.float32)
+
+    def _cloud_patch_points(self, umin: int, umax: int, vmin: int, vmax: int):
+        if pc2 is None or not isinstance(self.pc_msg, PointCloud2):
+            return None
+        if self.pc_msg.width == 0 or self.pc_msg.height == 0:
+            return None
+        step_u = max(1, (umax - umin) // 8)
+        step_v = max(1, (vmax - vmin) // 8)
+        pts = []
+        try:
+            for vv in range(vmin, vmax, step_v):
+                for uu in range(umin, umax, step_u):
+                    for p in pc2.read_points(
+                        self.pc_msg, field_names=("x", "y", "z"),
+                        skip_nans=True, uvs=[(uu, vv)]
+                    ):
+                        if np.isfinite(p[2]) and p[2] > 0.1:
+                            pts.append([p[0], p[1], p[2]])
+            if not pts:
+                return None
+            return np.array(pts, dtype=np.float32)
+        except Exception:
+            return None
 
     # ---------------- Outputs ----------------
     def publish_markers(self):
