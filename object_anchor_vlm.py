@@ -98,6 +98,7 @@ class VLMDetector:
         return base64.b64encode(enc.tobytes()).decode("utf-8")
 
     def _build_prompt(self, W: int, H: int, categories: List[str]) -> str:
+        # print(categories)
         cats = ", ".join(sorted(set(c.lower() for c in categories)))
         return (
             "You are an object detector. You may receive one or more images of the SAME scene "
@@ -347,7 +348,7 @@ class ObjectAnchorVLM(Node):
 
             try:
                 # tf2: transform to map frame
-                trans = self.tfbuf.lookup_transform("map", self.cam_frame, Time())  # you can add timeout=Duration(seconds=0.15) if needed
+                trans = self.tfbuf.lookup_transform("map", self.cam_frame, Time())  
                 tf_pt = tf2_geometry_msgs.do_transform_point(pt, trans)
                 xyz = np.array([tf_pt.point.x, tf_pt.point.y, tf_pt.point.z], dtype=np.float32)
             except Exception as e:
