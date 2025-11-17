@@ -5,7 +5,8 @@ import time
 import json
 import base64
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from pathlib import Path
 
 import numpy as np
 import cv2
@@ -18,10 +19,14 @@ from geometry_msgs.msg import PointStamped, PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
+from PIL import Image as PILImage
+import yaml
 
 import tf2_ros
 from rclpy.time import Time
 import tf2_geometry_msgs  # noqa: F401  (required to register transform for PointStamped)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 # --------------------- Canonical labels for the TB4 warehouse world ---------------------
@@ -31,13 +36,13 @@ CANON: Dict[str, List[str]] = {
     "table": ["table", "workbench", "bench table", "desk"],
     "shelf": ["shelf", "shelving", "shelving unit", "rack", "warehouse rack",
               "storage rack", "industrial rack", "racking system", "shelving rack"],
-    "pallet stack": ["pallet stack", "stack", "stack of boxes", "stacked boxes",
+    "stack": ["pallet stack", "stack", "stack of boxes", "stacked boxes",
                      "pile of boxes", "pallet", "palletized load", "palletized boxes"],
-    "box": ["box", "cardboard box", "carton", "crate", "package", "parcel"],
-    "trash can": ["trash can", "bin", "garbage can", "waste bin", "rubbish bin"],
-    "column": ["column", "pillar", "post", "support column", "support beam"],
-    "barrier": ["barrier", "concrete barrier", "k-rail", "divider", "block"],
-    "door": ["door", "doorway", "entry", "opening"],
+    "box": ["box", "cardboard box", "carton", "crate", "package", "parcel"]
+    # "trash can": ["trash can", "bin", "garbage can", "waste bin", "rubbish bin"],
+    # "column": ["column", "pillar", "post", "support column", "support beam"]
+    # "barrier": ["barrier", "concrete barrier", "k-rail", "divider", "block"],
+    # "door": ["door", "doorway", "entry", "opening"],
 }
 
 
@@ -194,6 +199,8 @@ class ObjectAnchorVLM(Node):
         self.declare_parameter("camera_depth", "/oakd/rgb/preview/depth")
         self.declare_parameter("camera_frame", "oakd_rgb_camera_optical_frame")
         self.declare_parameter("robot_pose_topic", "/map/pose")
+        self.declare_parameter("map_yaml_path", "./maps/savedmap.yaml")
+        self.declare_parameter("map_image_path", "./maps/savedmap.png")
 
         # Depth units (OAK-D depth is typically 16UC1 in millimeters)
         self.declare_parameter("depth_scale", 0.001)  # mm -> meters
@@ -201,22 +208,21 @@ class ObjectAnchorVLM(Node):
         # --- VLM detection ---
         self.declare_parameter("detect_rate_hz", 1.0)
         self.declare_parameter("categories", list(CANON.keys()))
-        self.declare_parameter("vlm_url", "http://ronaldo.eecs.umich.edu:11400/api/generate")
-        self.declare_parameter("vlm_model", "llava")
-        self.declare_parameter("vlm_api_style", "ollama")  # 'ollama' or 'chat'
+        self.declare_parameter("vlm_url", "http://saltyfish.eecs.umich.edu:8000/v1/chat/completions")
+        self.declare_parameter("vlm_model", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+        self.declare_parameter("vlm_api_style", "chat")  # 'ollama' or 'chat'
         self.declare_parameter("send_depth_to_vlm", True)  # include depth colormap as second image
         self.declare_parameter("display_rgb", False)
         self.declare_parameter("display_depth", False)
         self.declare_parameter("log_raw_vlm", False)
+        self.declare_parameter("detection_log_path", "/tmp/object_detections.jsonl")
 
-        # --- Tracking / promotion ---
+        # --- Tracking ---
         self.declare_parameter("gate_radius", 0.7)       # m, assoc gate
-        self.declare_parameter("promote_min_obs", 4)     # min observations to anchor
-        self.declare_parameter("promote_max_std", 0.35)  # m, XY std threshold
 
         # --- Output ---
         self.declare_parameter("save_json", True)
-        self.declare_parameter("json_path", "/tmp/objects.json")
+        self.declare_parameter("json_path", str(SCRIPT_DIR / "obj_coordinates.json"))
 
         # Read params
         gp = self.get_parameter
@@ -225,6 +231,8 @@ class ObjectAnchorVLM(Node):
         self.depth_topic = gp("camera_depth").value
         self.cam_frame = gp("camera_frame").value
         self.robot_pose_topic = gp("robot_pose_topic").value
+        self.map_yaml_path = Path(str(gp("map_yaml_path").value))
+        self.map_image_path = Path(str(gp("map_image_path").value))
         self.depth_scale = float(gp("depth_scale").value)
 
         self.detect_dt = 1.0 / float(gp("detect_rate_hz").value)
@@ -234,6 +242,7 @@ class ObjectAnchorVLM(Node):
         self.display_depth = bool(gp("display_depth").value)
         self.vlm_api_style = str(gp("vlm_api_style").value)
         self.log_raw_vlm = bool(gp("log_raw_vlm").value)
+        self.detection_log_path = Path(str(gp("detection_log_path").value))
 
         self.detector = VLMDetector(
             url=str(gp("vlm_url").value),
@@ -244,8 +253,6 @@ class ObjectAnchorVLM(Node):
         )
 
         self.gate_r = float(gp("gate_radius").value)
-        self.promote_n = int(gp("promote_min_obs").value)
-        self.promote_std = float(gp("promote_max_std").value)
         self.save_json = bool(gp("save_json").value)
         self.json_path = str(gp("json_path").value)
 
@@ -275,6 +282,12 @@ class ObjectAnchorVLM(Node):
         self._display_error_logged = False
         self._latest_depth_vis = None
         self._latest_rgb = None
+        self.map_resolution: Optional[float] = None
+        self.map_width_px: Optional[int] = None
+        self.map_height_px: Optional[int] = None
+        self.map_half_width_m: Optional[float] = None
+        self.map_half_height_m: Optional[float] = None
+        self._load_map_metadata()
         self._init_display_windows()
 
     # ---------------- Callbacks ----------------
@@ -354,15 +367,16 @@ class ObjectAnchorVLM(Node):
         self.publish_markers()
         if self.save_json:
             self.write_json()
-        anch = sum(1 for L in self.store.values() for t in L if t["anchored"])
-        pend = sum(1 for L in self.store.values() for t in L if not t["anchored"])
-        self.get_logger().info(f"Anchors: {anch}  |  Pending tracks: {pend}  |  Labels: {list(self.store.keys())[:6]}")
+        total_tracks = sum(len(L) for L in self.store.values())
+        self.get_logger().info(f"Tracks: {total_tracks}  |  Labels: {list(self.store.keys())[:6]}")
         pose_tuple = self._current_robot_pose()
         if pose_tuple:
             rx, ry, rz, yaw = pose_tuple
             self.get_logger().info(
                 f"Robot pose (map frame): x={rx:.2f} m, y={ry:.2f} m, z={rz:.2f} m, yaw={math.degrees(yaw):.1f} deg"
             )
+        if detections_to_report:
+            self.append_detection_log(detections_to_report)
         for label, xyz, score in detections_to_report:
             dist = float(np.linalg.norm(xyz))
             self.get_logger().info(
@@ -386,15 +400,11 @@ class ObjectAnchorVLM(Node):
             t["mean"] += delta / t["n"]
             t["M2"] += delta * (xyz - t["mean"])
             t["last"] = time.time()
-            std = np.sqrt(np.maximum(t["M2"] / max(1, t["n"] - 1), 1e-9))
-            if (not t["anchored"]) and (t["n"] >= self.promote_n) and (np.linalg.norm(std[:2]) <= self.promote_std):
-                t["anchored"] = True
         else:
             tracks.append({
                 "mean": xyz.copy(),
                 "M2": np.zeros(3, np.float32),
                 "n": 1,
-                "anchored": False,
                 "last": time.time(),
             })
 
@@ -456,6 +466,68 @@ class ObjectAnchorVLM(Node):
         composite = np.hstack(canvas)
         self._display_image(composite)
 
+    def append_detection_log(self, detections: List[Tuple[str, np.ndarray, float]]):
+        if not self.detection_log_path:
+            return
+        timestamp = self.get_clock().now().nanoseconds * 1e-9
+        pose = self._current_robot_pose()
+        entries = []
+        for label, xyz, score in detections:
+            pix = self._map_to_lower_left_pixel(float(xyz[0]), float(xyz[1]))
+            entry = {
+                "timestamp": timestamp,
+                "label": label,
+                "score": float(score),
+                "map_xyz": self._round_vals([xyz[0], xyz[1], xyz[2]]),
+            }
+            if pix:
+                entry["pixel_lower_left"] = self._round_vals(pix)
+            if pose:
+                entry["robot_pose"] = {
+                    "map_xyz": self._round_vals(pose[:3]),
+                    "yaw_rad": round(float(pose[3]), 2),
+                }
+            entries.append(entry)
+        try:
+            self.detection_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.detection_log_path, "a", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to append detection log: {exc}")
+
+    def _load_map_metadata(self):
+        try:
+            if self.map_yaml_path.exists():
+                with open(self.map_yaml_path, "r") as f:
+                    data = yaml.safe_load(f) or {}
+                res = float(data.get("resolution", 0.05))
+                image_rel = data.get("image")
+                if image_rel:
+                    candidate = (self.map_yaml_path.parent / image_rel).resolve()
+                    if candidate.exists():
+                        self.map_image_path = candidate
+            else:
+                res = 0.05
+            img_path = self.map_image_path
+            if not img_path.exists():
+                raise FileNotFoundError(f"Map image {img_path} not found")
+            img = PILImage.open(str(img_path))
+            self.map_width_px, self.map_height_px = img.size
+            self.map_resolution = res
+            width_m = self.map_width_px * self.map_resolution
+            height_m = self.map_height_px * self.map_resolution
+            self.map_half_width_m = width_m / 2.0
+            self.map_half_height_m = height_m / 2.0
+            self.get_logger().info(
+                f"Loaded map metadata: {self.map_width_px}x{self.map_height_px} px @ {self.map_resolution:.3f} m/px"
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to load map metadata: {exc}")
+            self.map_resolution = None
+            self.map_width_px = self.map_height_px = None
+            self.map_half_width_m = self.map_half_height_m = None
+
     def estimate_camera_xyz(self, umin: int, umax: int, vmin: int, vmax: int) -> np.ndarray:
         pts = self._depth_patch_points(umin, umax, vmin, vmax)
         if pts is None or pts.shape[0] < 5:
@@ -494,6 +566,17 @@ class ObjectAnchorVLM(Node):
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return (float(p.x), float(p.y), float(p.z), yaw)
 
+    def _map_to_lower_left_pixel(self, x: float, y: float) -> Optional[Tuple[float, float]]:
+        if None in (self.map_resolution, self.map_half_width_m, self.map_half_height_m):
+            return None
+        px = (x + self.map_half_width_m) / self.map_resolution
+        py = (y + self.map_half_height_m) / self.map_resolution
+        return float(px), float(py)
+
+    @staticmethod
+    def _round_vals(values):
+        return [round(float(v), 2) for v in values]
+
     # ---------------- Outputs ----------------
     def publish_markers(self):
         arr = MarkerArray()
@@ -501,48 +584,33 @@ class ObjectAnchorVLM(Node):
         for label, tracks in self.store.items():
             for t in tracks:
                 x, y, z = [float(v) for v in t["mean"]]
-                if t["anchored"]:
-                    cube = Marker()
-                    cube.header.frame_id = "map"
-                    cube.header.stamp = self.get_clock().now().to_msg()
-                    cube.ns = f"obj/{label}"
-                    cube.id = mid; mid += 1
-                    cube.type = Marker.CUBE
-                    cube.action = Marker.ADD
-                    cube.pose.position.x = x
-                    cube.pose.position.y = y
-                    cube.pose.position.z = max(0.05, z)
-                    cube.scale.x = cube.scale.y = cube.scale.z = 0.25
-                    cube.color.r, cube.color.g, cube.color.b, cube.color.a = 0.1, 0.8, 0.1, 0.9
-                    arr.markers.append(cube)
+                cube = Marker()
+                cube.header.frame_id = "map"
+                cube.header.stamp = self.get_clock().now().to_msg()
+                cube.ns = f"obj/{label}"
+                cube.id = mid; mid += 1
+                cube.type = Marker.CUBE
+                cube.action = Marker.ADD
+                cube.pose.position.x = x
+                cube.pose.position.y = y
+                cube.pose.position.z = max(0.05, z)
+                cube.scale.x = cube.scale.y = cube.scale.z = 0.25
+                cube.color.r, cube.color.g, cube.color.b, cube.color.a = 0.1, 0.8, 0.1, 0.9
+                arr.markers.append(cube)
 
-                    txt = Marker()
-                    txt.header = cube.header
-                    txt.ns = cube.ns + "/text"
-                    txt.id = mid; mid += 1
-                    txt.type = Marker.TEXT_VIEW_FACING
-                    txt.action = Marker.ADD
-                    txt.pose.position.x = x
-                    txt.pose.position.y = y
-                    txt.pose.position.z = max(0.35, z + 0.25)
-                    txt.scale.z = 0.25
-                    txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
-                    txt.text = f"{label}"
-                    arr.markers.append(txt)
-                else:
-                    sph = Marker()
-                    sph.header.frame_id = "map"
-                    sph.header.stamp = self.get_clock().now().to_msg()
-                    sph.ns = f"pending/{label}"
-                    sph.id = mid; mid += 1
-                    sph.type = Marker.SPHERE
-                    sph.action = Marker.ADD
-                    sph.pose.position.x = x
-                    sph.pose.position.y = y
-                    sph.pose.position.z = max(0.05, z)
-                    sph.scale.x = sph.scale.y = sph.scale.z = 0.22
-                    sph.color.r, sph.color.g, sph.color.b, sph.color.a = 0.2, 0.2, 0.8, 0.6
-                    arr.markers.append(sph)
+                txt = Marker()
+                txt.header = cube.header
+                txt.ns = cube.ns + "/text"
+                txt.id = mid; mid += 1
+                txt.type = Marker.TEXT_VIEW_FACING
+                txt.action = Marker.ADD
+                txt.pose.position.x = x
+                txt.pose.position.y = y
+                txt.pose.position.z = max(0.35, z + 0.25)
+                txt.scale.z = 0.25
+                txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
+                txt.text = f"{label}"
+                arr.markers.append(txt)
 
         self.pub_mark.publish(arr)
 
@@ -554,19 +622,21 @@ class ObjectAnchorVLM(Node):
             q = self.robot_pose.pose.orientation
             pose_snapshot = {
                 "frame": self.robot_pose.header.frame_id or "map",
-                "position": [float(p.x), float(p.y), float(p.z)],
-                "orientation": [float(q.x), float(q.y), float(q.z), float(q.w)],
+                "position": self._round_vals([p.x, p.y, p.z]),
+                "orientation": self._round_vals([q.x, q.y, q.z, q.w]),
             }
         for label, tracks in self.store.items():
             for t in tracks:
-                if not t["anchored"]:
-                    continue
+                map_xyz = self._round_vals(t["mean"])
                 entry = {
                     "label": label,
-                    "xyz": [float(v) for v in t["mean"]],
+                    "map_xyz": map_xyz,
                     "n": int(t["n"]),
                     "last_seen": float(t["last"]),
                 }
+                pix = self._map_to_lower_left_pixel(map_xyz[0], map_xyz[1])
+                if pix:
+                    entry["pixel_lower_left"] = self._round_vals(pix)
                 if pose_snapshot:
                     entry["robot_pose"] = pose_snapshot
                 out.append(entry)
