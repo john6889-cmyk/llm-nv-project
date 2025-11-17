@@ -73,10 +73,6 @@ class Detection:
 
 
 class VLMDetector:
-    """
-    Client that can talk to either the Ollama-style `/api/generate` endpoint or
-    the OpenAI/Qwen chat-completions endpoint.
-    """
 
     def __init__(
         self,
