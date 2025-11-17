@@ -136,7 +136,7 @@ class VLMDetector:
         }
         r = requests.post(self.url, json=payload, timeout=self.timeout)
         r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"].strip()
+        reply = r.json()["response"][0]["message"]["content"].strip()
 
         # Strip code fences if present
         if reply.startswith("```"):
